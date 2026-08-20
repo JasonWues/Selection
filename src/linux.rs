@@ -7,23 +7,55 @@ use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
 use wl_clipboard_rs::utils::is_primary_selection_supported;
 use x11_clipboard::Clipboard;
 
+enum Session {
+    X11,
+    Wayland,
+}
+
+/// Which display server the selection should be read from.
+///
+/// `XDG_SESSION_TYPE` is the direct answer, but only when something set it, and
+/// plenty of ways of starting a process do not: a .desktop entry launched
+/// without a session manager, a systemd user unit, a login shell over ssh --
+/// and WSLg, where the whole graphical stack is present and that variable is
+/// simply absent. This used to give up there and return an empty string, so
+/// selection lookups silently did nothing.
+///
+/// `WAYLAND_DISPLAY` and `DISPLAY` are set by the compositor and the X server
+/// themselves, which makes them a better answer to the same question. Wayland
+/// is tested first: a Wayland session usually runs Xwayland too, so `DISPLAY`
+/// is set under both and cannot tell them apart on its own.
+fn session() -> Option<Session> {
+    match var("XDG_SESSION_TYPE").as_deref() {
+        Ok("wayland") => return Some(Session::Wayland),
+        Ok("x11") => return Some(Session::X11),
+        Ok(other) if !other.is_empty() => {
+            info!("unrecognised XDG_SESSION_TYPE {other}, looking at the display variables instead");
+        }
+        _ => {}
+    }
+
+    if var("WAYLAND_DISPLAY").is_ok() {
+        Some(Session::Wayland)
+    } else if var("DISPLAY").is_ok() {
+        Some(Session::X11)
+    } else {
+        None
+    }
+}
+
 pub fn get_text() -> String {
-    match var("XDG_SESSION_TYPE") {
-        Ok(session_type) => match session_type.as_str() {
-            "x11" => match get_text_on_x11() {
-                Ok(text) => return text,
-                Err(err) => error!("{}", err),
-            },
-            "wayland" => match get_text_on_wayland() {
-                Ok(text) => return text,
-                Err(err) => error!("{}", err),
-            },
-            _ => {
-                error!("Unknown Session Type: {session_type}");
-            }
+    match session() {
+        Some(Session::Wayland) => match get_text_on_wayland() {
+            Ok(text) => return text,
+            Err(err) => error!("{}", err),
         },
-        Err(err) => {
-            error!("{}", err);
+        Some(Session::X11) => match get_text_on_x11() {
+            Ok(text) => return text,
+            Err(err) => error!("{}", err),
+        },
+        None => {
+            error!("no graphical session: none of XDG_SESSION_TYPE, WAYLAND_DISPLAY or DISPLAY is set");
         }
     }
     // Return Empty String
@@ -46,17 +78,18 @@ fn get_text_on_x11() -> Result<String, Box<dyn Error>> {
 }
 
 fn get_text_on_wayland() -> Result<String, Box<dyn Error>> {
-    if let Ok(support) = is_primary_selection_supported() {
-        if !support {
-            std::env::set_var("XDG_SESSION_TYPE", "x11");
-            std::env::set_var("GDK_BACKEND", "x11");
-            info!("Primary Selection is not supported. Fallback to use X11 Clipboard");
-            return get_text_on_x11();
-        }
-    } else {
-        std::env::set_var("XDG_SESSION_TYPE", "x11");
-        std::env::set_var("GDK_BACKEND", "x11");
-        info!("Primary Selection is not supported. Fallback to use X11 Clipboard");
+    // Primary selection is an optional Wayland protocol; a compositor that does
+    // not implement it will never answer. Xwayland usually is there, and under
+    // it the selection is reachable the X11 way, so that is the fallback.
+    //
+    // It used to write XDG_SESSION_TYPE and GDK_BACKEND into the process
+    // environment on the way past. Nothing here reads either of them again --
+    // the next line already calls the X11 path directly -- so the writes bought
+    // nothing, while `set_var` is not thread safe (unsafe outright from Rust
+    // 2024), this runs on whichever thread the caller's hotkey landed on, and
+    // pot manipulates the same environment block for its proxy settings.
+    if !is_primary_selection_supported().unwrap_or(false) {
+        info!("primary selection is not supported, falling back to the X11 clipboard");
         return get_text_on_x11();
     }
 
