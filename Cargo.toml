@@ -15,15 +15,29 @@ edition = "2021"
 log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-windows = {version="0.56.0",features= ["Win32_UI_WindowsAndMessaging", "Win32_Foundation","Win32_System_Threading","Win32_UI_Input_KeyboardAndMouse","Win32_System_DataExchange","Win32_UI_Accessibility","Win32_System_Com"] }
-enigo = "0.2.0"
-arboard = "3.4.0"
+# 0.62 rather than the 0.56 this used to ask for. pot, the main consumer of this
+# crate, depends on windows 0.62 itself, and the mismatch meant cargo built two
+# entire copies of the bindings into one binary.
+windows = { version = "0.62.2", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
+] }
+enigo = "0.6.1"
+arboard = "3.6.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11-clipboard = "0.9.2"
-wl-clipboard-rs = "0.8.0"
+x11-clipboard = "0.9.3"
+wl-clipboard-rs = "0.8.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Deliberately not 0.10: accessibility-ng 0.1.6 asks for core-foundation ^0.9.3,
+# and macos.rs hands CFStrings straight to it. Two incompatible core-foundations
+# in one tree would make those the wrong type at the boundary.
 core-foundation = "0.9.4"
 accessibility-ng = "0.1.6"
 accessibility-sys-ng = "0.1.3"
