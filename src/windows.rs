@@ -2,7 +2,9 @@ use arboard::Clipboard;
 use log::{error, info};
 use std::error::Error;
 use std::time::{Duration, Instant};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitialize, CLSCTX_ALL};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPatternId,
@@ -37,10 +39,41 @@ pub fn get_text() -> String {
     String::new()
 }
 
+// COM has to be initialised on whichever thread calls in, and every successful
+// initialisation owes a matching CoUninitialize. This used to initialise on
+// every call and balance none of them, so the apartment's reference count only
+// ever climbed.
+//
+// The flag is what makes this correct rather than merely symmetric.
+// CoInitializeEx answers three different ways: S_OK for "you initialised it",
+// S_FALSE for "it was already initialised and you now hold a reference" -- both
+// of which we owe a CoUninitialize for -- and RPC_E_CHANGED_MODE for "somebody
+// else chose a different apartment", which we owe nothing for and must not
+// balance, since doing so would pull COM out from under whoever set it up.
+// `HRESULT::is_ok()` is true for the first two and false for the third, which
+// is exactly that distinction.
+struct ComGuard(bool);
+
+impl ComGuard {
+    fn new() -> Self {
+        Self(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok())
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 // Available for Edge, Chrome and UWP
 fn get_text_by_automation() -> Result<String, Box<dyn Error>> {
-    // Init COM
-    let _ = unsafe { CoInitialize(None) };
+    // Declared before every interface pointer below, and so dropped after all of
+    // them: releasing a COM object once its apartment is gone is undefined, and
+    // Rust drops locals in reverse declaration order.
+    let _com = ComGuard::new();
     // Create IUIAutomation instance
     let auto: IUIAutomation = unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL) }?;
     // Get Focused Element
@@ -63,48 +96,41 @@ fn get_text_by_automation() -> Result<String, Box<dyn Error>> {
 
 // Available for almost all applications
 fn get_text_by_clipboard() -> Result<String, Box<dyn Error>> {
-    // Read Old Clipboard
-    let old_clipboard = (Clipboard::new()?.get_text(), Clipboard::new()?.get_image());
+    // One handle for the whole function. On Windows `Clipboard::new` is a
+    // zero-sized value that opens nothing -- each operation opens and closes the
+    // clipboard for itself -- so holding this across `copy()` below does not
+    // keep the clipboard locked away from the application being copied from.
+    let mut clipboard = Clipboard::new()?;
 
-    if copy() {
-        // Read New Clipboard
-        let new_text = Clipboard::new()?.get_text();
+    // The image is only ever needed to put it back when there was no text, so it
+    // is fetched only then. Reading it up front copied an entire bitmap out of
+    // the clipboard and dropped it again every time the clipboard held text --
+    // and text is the usual case, since something was just selected.
+    let old_text = clipboard.get_text();
+    let old_image = match old_text {
+        Ok(_) => None,
+        Err(_) => clipboard.get_image().ok(),
+    };
 
-        // Create Write Clipboard
-        let mut write_clipboard = Clipboard::new()?;
-
-        match old_clipboard {
-            (Ok(text), _) => {
-                // Old Clipboard is Text
-                write_clipboard.set_text(text)?;
-                if let Ok(new) = new_text {
-                    Ok(new.trim().to_string())
-                } else {
-                    Err("New clipboard is not Text".into())
-                }
-            }
-            (_, Ok(image)) => {
-                // Old Clipboard is Image
-                write_clipboard.set_image(image)?;
-                if let Ok(new) = new_text {
-                    Ok(new.trim().to_string())
-                } else {
-                    Err("New clipboard is not Text".into())
-                }
-            }
-            _ => {
-                // Old Clipboard is Empty
-                write_clipboard.clear()?;
-                if let Ok(new) = new_text {
-                    Ok(new.trim().to_string())
-                } else {
-                    Err("New clipboard is not Text".into())
-                }
-            }
-        }
-    } else {
-        Err("Copy Failed".into())
+    if !copy() {
+        return Err("Copy Failed".into());
     }
+
+    let new_text = clipboard.get_text();
+
+    // Restore first, and unconditionally: returning early on an unreadable new
+    // clipboard would leave the user's own clipboard replaced by the selection.
+    //
+    // Still only one format deep -- HTML, RTF and a copied file list do not
+    // survive this and never did. Fixing that needs the raw clipboard API;
+    // arboard knows four formats and its setters replace rather than compose.
+    match (old_text, old_image) {
+        (Ok(text), _) => clipboard.set_text(text)?,
+        (_, Some(image)) => clipboard.set_image(image)?,
+        _ => clipboard.clear()?,
+    }
+
+    Ok(new_text?.trim().to_string())
 }
 
 // How long to give the foreground application to answer the synthesised Ctrl+C,
